@@ -1,5 +1,6 @@
 streamlit
 pandas
 fpdf
+openpyxl
 pywin32; sys_platform == 'win32'
 pythoncom; sys_platform == 'win32'
