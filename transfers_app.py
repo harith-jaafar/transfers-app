@@ -3,8 +3,6 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from fpdf import FPDF
-import win32com.client
-import pythoncom
 import zipfile
 from io import BytesIO
 import os
@@ -13,6 +11,20 @@ import time
 import threading
 import math
 import webbrowser
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+
+# Check if running on Windows (for local development)
+WINDOWS_ENV = False
+try:
+    import win32com.client
+    import pythoncom
+    WINDOWS_ENV = True
+except ImportError:
+    pass
 
 def sanitize_filename(name):
     return re.sub(r'[<>:"/\\|?*]', '', name)
@@ -20,24 +32,70 @@ def sanitize_filename(name):
 def safe_str(text):
     return str(text).replace("–", "-").encode('latin-1', errors='replace').decode('latin-1')
 
-def send_email_outlook(recipient, subject, body, attachment_path):
-    try:
-        pythoncom.CoInitialize()
-        if not os.path.exists(attachment_path):
-            st.error(f"❌ Attachment not found: {attachment_path}")
-            return False
+def send_email(recipient, subject, body, attachment_path=None):
+    """Generic email function that works both locally (Outlook) and in cloud (SMTP)"""
+    
+    # Cloud environment - use SMTP
+    if not WINDOWS_ENV:
+        try:
+            # Configure these in your Streamlit secrets
+            smtp_server = st.secrets.get("SMTP_SERVER", "smtp.gmail.com")
+            smtp_port = st.secrets.get("SMTP_PORT", 587)
+            smtp_username = st.secrets.get("SMTP_USERNAME")
+            smtp_password = st.secrets.get("SMTP_PASSWORD")
+            
+            if not all([smtp_server, smtp_username, smtp_password]):
+                st.warning("Email configuration incomplete. Please set SMTP credentials in secrets.")
+                return False
 
-        outlook = win32com.client.Dispatch("Outlook.Application")
-        mail = outlook.CreateItem(0)
-        mail.To = "; ".join(recipient) if isinstance(recipient, list) else recipient
-        mail.Subject = subject
-        mail.Body = body
-        mail.Attachments.Add(os.path.abspath(attachment_path))
-        mail.Display()  # Opens the email draft without sending
-        return True
-    except Exception as e:
-        st.exception(e)
-        return False
+            msg = MIMEMultipart()
+            msg['From'] = smtp_username
+            msg['To'] = recipient if isinstance(recipient, str) else ", ".join(recipient)
+            msg['Subject'] = subject
+            msg.attach(MIMEText(body, 'plain'))
+
+            if attachment_path and os.path.exists(attachment_path):
+                with open(attachment_path, "rb") as attachment:
+                    part = MIMEBase('application', 'octet-stream')
+                    part.set_payload(attachment.read())
+                encoders.encode_base64(part)
+                part.add_header(
+                    'Content-Disposition',
+                    f'attachment; filename={os.path.basename(attachment_path)}',
+                )
+                msg.attach(part)
+
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_username, smtp_password)
+                server.send_message(msg)
+            
+            return True
+            
+        except Exception as e:
+            st.error(f"Failed to send email via SMTP: {str(e)}")
+            return False
+    
+    # Local environment - use Outlook
+    else:
+        try:
+            pythoncom.CoInitialize()
+            if attachment_path and not os.path.exists(attachment_path):
+                st.error(f"❌ Attachment not found: {attachment_path}")
+                return False
+
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            mail = outlook.CreateItem(0)
+            mail.To = "; ".join(recipient) if isinstance(recipient, list) else recipient
+            mail.Subject = subject
+            mail.Body = body
+            if attachment_path:
+                mail.Attachments.Add(os.path.abspath(attachment_path))
+            mail.Display()  # Opens the email draft without sending
+            return True
+        except Exception as e:
+            st.exception(e)
+            return False
 
 def is_port_open(host, port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -428,7 +486,7 @@ if payments_file and transactions_file:
                                         "Best regards"
                                     )
                                     if st.button("📧 PDF", key=f"email_pdf_{merchant_id}"):
-                                        if send_email_outlook(email, email_subject, email_body, file_path):
+                                        if send_email(email, email_subject, email_body, file_path):
                                             st.success(f"PDF sent to {email}")
                                         else:
                                             st.error(f"Failed to send PDF")
@@ -446,7 +504,7 @@ if payments_file and transactions_file:
                                         "Best regards"
                                     )
                                     if st.button("📧 Excel", key=f"email_excel_{merchant_id}"):
-                                        if send_email_outlook(email, excel_subject, excel_body, excel_file_path):
+                                        if send_email(email, excel_subject, excel_body, excel_file_path):
                                             st.success(f"Excel sent to {email}")
                                         else:
                                             st.error(f"Failed to send Excel")
@@ -455,13 +513,31 @@ if payments_file and transactions_file:
                             with btn_col5:
                                 if merchant_id in merchant_emails:
                                     if st.button("📧 Both", key=f"email_both_{merchant_id}"):
-                                        try:
-                                            pythoncom.CoInitialize()
-                                            outlook = win32com.client.Dispatch("Outlook.Application")
-                                            mail = outlook.CreateItem(0)
-                                            mail.To = email
-                                            mail.Subject = f"Complete Settlement Report for {merchant_name}"
-                                            mail.Body = (
+                                        if WINDOWS_ENV:
+                                            try:
+                                                pythoncom.CoInitialize()
+                                                outlook = win32com.client.Dispatch("Outlook.Application")
+                                                mail = outlook.CreateItem(0)
+                                                mail.To = email
+                                                mail.Subject = f"Complete Settlement Report for {merchant_name}"
+                                                mail.Body = (
+                                                    f"Dear,\n\n"
+                                                    f"Please find attached both PDF and Excel versions of your settlement report.\n\n"
+                                                    f"Merchant ID: {merchant_id}\n"
+                                                    f"Date Range: {from_date.strftime('%d/%m/%Y')} to {to_date.strftime('%d/%m/%Y')}\n"
+                                                    f"Settled Amount: {net_total:,.2f} IQD\n\n"
+                                                    "Best regards"
+                                                )
+                                                mail.Attachments.Add(os.path.abspath(file_path))
+                                                mail.Attachments.Add(os.path.abspath(excel_file_path))
+                                                mail.Display()
+                                                st.success(f"Email draft created")
+                                            except Exception as e:
+                                                st.error(f"Failed to create email: {str(e)}")
+                                        else:
+                                            # Cloud version - send both attachments via SMTP
+                                            combined_subject = f"Complete Settlement Report for {merchant_name}"
+                                            combined_body = (
                                                 f"Dear,\n\n"
                                                 f"Please find attached both PDF and Excel versions of your settlement report.\n\n"
                                                 f"Merchant ID: {merchant_id}\n"
@@ -469,12 +545,11 @@ if payments_file and transactions_file:
                                                 f"Settled Amount: {net_total:,.2f} IQD\n\n"
                                                 "Best regards"
                                             )
-                                            mail.Attachments.Add(os.path.abspath(file_path))
-                                            mail.Attachments.Add(os.path.abspath(excel_file_path))
-                                            mail.Display()
-                                            st.success(f"Email draft created")
-                                        except Exception as e:
-                                            st.error(f"Failed to create email: {str(e)}")
+                                            if send_email(email, combined_subject, combined_body, file_path) and \
+                                               send_email(email, combined_subject, combined_body, excel_file_path):
+                                                st.success(f"Both files sent to {email}")
+                                            else:
+                                                st.error(f"Failed to send both files")
 
                     else:
                         st.error(f"❌ Failed to generate PDF for {merchant_name}")
